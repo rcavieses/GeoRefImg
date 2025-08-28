@@ -1,0 +1,8 @@
+# Dependencias para georefimg.py
+# Instalar con: pip install -r requirements.txt
+
+numpy
+matplotlib
+imageio
+pyshp  # proporciona el módulo 'shapefile'
+# shapely  # Opcional: para manipulación geométrica más avanzada
