@@ -77,19 +77,9 @@ class ControlPoint:
 @dataclass
 class DigitizedPolygon:
     name: str
-    pixel_rings: List[List[Tuple[float, float]]]  # Multiple rings (col,row)
-    world_rings: List[List[Tuple[float, float]]]  # Multiple rings (x,y)
+    pixel_points: List[Tuple[float, float]]  # (col,row)
+    world_points: List[Tuple[float, float]]  # (x,y)
     id: int = field(default=0)
-    
-    @property
-    def pixel_points(self):
-        """Backward compatibility - returns first ring"""
-        return self.pixel_rings[0] if self.pixel_rings else []
-    
-    @property 
-    def world_points(self):
-        """Backward compatibility - returns first ring"""
-        return self.world_rings[0] if self.world_rings else []
 
 
 class GeoRefApp:
@@ -102,15 +92,19 @@ class GeoRefApp:
         self.transform: Optional[np.ndarray] = None  # 6 params (A,B,C,D,E,F) world file style
         self.stage = 1  # 1 puntos, 2 polígonos
         self.drawing = False
-        self.drawing_mode = "lines"  # "lines" or "rectangle"
+        self.drawing_mode = "freehand"  # "freehand" or "rectangle"
         self.mouse_pressed = False
         self.rect_start = None
         self._last_mouse_pos = None
-        self.current_poly_pixels = []  # Current ring being drawn
-        self.current_polygon_rings = []  # All rings of current polygon
-        self.current_polygon_name = None  # Name of polygon being drawn
+        self.current_poly_pixels = []
         self.polygons = []
         self.next_poly_id = 1
+        
+        # Navigation control variables
+        self.pan_mode = False
+        self.pan_start = None
+        self.pan_start_xlim = None
+        self.pan_start_ylim = None
 
         self._build_ui()
 
@@ -123,35 +117,89 @@ class GeoRefApp:
         self.left_frame = ttk.Frame(self.main_pane, padding=5)
         self.main_pane.add(self.left_frame, weight=0)
 
-        # Right frame - figure
+        # Right frame - figure and zoom controls
         self.right_frame = ttk.Frame(self.main_pane)
         self.main_pane.add(self.right_frame, weight=1)
+
+        # Create a horizontal frame to hold the figure and zoom buttons
+        self.image_container = ttk.Frame(self.right_frame)
+        self.image_container.pack(fill=tk.BOTH, expand=True)
+
+        # Figure frame (takes most of the space)
+        self.figure_frame = ttk.Frame(self.image_container)
+        self.figure_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Zoom buttons frame (fixed width on the right)
+        self.zoom_buttons_frame = ttk.Frame(self.image_container, width=80)
+        self.zoom_buttons_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(5, 0))
+        self.zoom_buttons_frame.pack_propagate(False)  # Maintain fixed width
 
         # Figure
         self.fig = Figure(figsize=(6, 6))
         self.ax = self.fig.add_subplot(111)
         self.ax.set_axis_off()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right_frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.figure_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Connect mouse and keyboard events
         self.canvas.mpl_connect('button_press_event', self.on_click)
         self.canvas.mpl_connect('motion_notify_event', self.on_motion)
         self.canvas.mpl_connect('button_release_event', self.on_release)
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        self.canvas.mpl_connect('key_press_event', self.on_key_press)
+        
+        # Make canvas focusable for keyboard events
+        self.canvas.get_tk_widget().focus_set()
+        self.canvas.get_tk_widget().bind('<Button-1>', self._focus_canvas)
+
+        # Add zoom buttons beside the image
+        self._create_image_zoom_controls()
 
         # Controls for stage 1
         ttk.Label(self.left_frame, text="Etapa 1: Puntos de Control").pack(anchor='w', pady=(0, 4))
         ttk.Button(self.left_frame, text="Cargar PNG", command=self.load_image).pack(fill='x')
         self.points_listbox = tk.Listbox(self.left_frame, height=8)
         self.points_listbox.pack(fill='both', expand=False, pady=4)
+        
+        # First row of control point buttons
         btn_frame = ttk.Frame(self.left_frame)
         btn_frame.pack(fill='x')
-        ttk.Button(btn_frame, text="Asignar Coord", command=self.assign_coord).pack(side=tk.LEFT, expand=True, fill='x')
-        ttk.Button(btn_frame, text="Importar CSV", command=self.import_control_csv).pack(side=tk.LEFT, expand=True, fill='x')
+        ttk.Button(btn_frame, text="Asignar Coord", command=self.assign_coord).pack(side=tk.LEFT, expand=True, fill='x', padx=(0,1))
+        ttk.Button(btn_frame, text="Importar CSV", command=self.import_control_csv).pack(side=tk.LEFT, expand=True, fill='x', padx=(1,0))
+        
+        # Second row of control point buttons
+        btn_frame2 = ttk.Frame(self.left_frame)
+        btn_frame2.pack(fill='x', pady=(2,0))
+        ttk.Button(btn_frame2, text="Borrar Último Punto", command=self.delete_last_point).pack(side=tk.LEFT, expand=True, fill='x', padx=(0,1))
+        ttk.Button(btn_frame2, text="Limpiar Todo", command=self.clear_all_points).pack(side=tk.LEFT, expand=True, fill='x', padx=(1,0))
         ttk.Button(self.left_frame, text="Calcular Transformación", command=self.compute_transform).pack(fill='x', pady=(4, 0))
         self.lbl_transform = ttk.Label(self.left_frame, text="Transformación: --")
         self.lbl_transform.pack(fill='x', pady=4)
         ttk.Button(self.left_frame, text="Guardar World File", command=self.save_world_file).pack(fill='x')
         self.btn_to_polys = ttk.Button(self.left_frame, text="Ir a Polígonos", command=self.go_to_polygons, state=tk.DISABLED)
-        self.btn_to_polys.pack(fill='x', pady=(6, 10))
+        self.btn_to_polys.pack(fill='x', pady=(6, 4))
+
+        # Zoom controls
+        zoom_frame = ttk.LabelFrame(self.left_frame, text="Navegación", padding=5)
+        zoom_frame.pack(fill='x', pady=4)
+        
+        # First row of zoom controls
+        zoom_row1 = ttk.Frame(zoom_frame)
+        zoom_row1.pack(fill='x', pady=2)
+        ttk.Button(zoom_row1, text="Zoom In (+)", command=self.zoom_in).pack(side=tk.LEFT, expand=True, fill='x', padx=(0,2))
+        ttk.Button(zoom_row1, text="Zoom Out (-)", command=self.zoom_out).pack(side=tk.LEFT, expand=True, fill='x', padx=(2,0))
+        
+        # Second row of zoom controls
+        zoom_row2 = ttk.Frame(zoom_frame)
+        zoom_row2.pack(fill='x', pady=2)
+        self.pan_button = ttk.Button(zoom_row2, text="Pan (P)", command=self.toggle_pan)
+        self.pan_button.pack(side=tk.LEFT, expand=True, fill='x', padx=(0,2))
+        ttk.Button(zoom_row2, text="Reset (R)", command=self.reset_view).pack(side=tk.LEFT, expand=True, fill='x', padx=(2,0))
+        
+        # Navigation instructions
+        nav_info = ttk.Label(zoom_frame, text="• Rueda del ratón: Zoom\n• Arrastrar: Pan (modo Pan activo)\n• Teclas: +/- zoom, P pan, R reset\n• Flechas ↑↓←→: navegar imagen\n• Del/Backspace: borrar último punto", 
+                            font=('TkDefaultFont', 8), foreground='gray')
+        nav_info.pack(fill='x', pady=(4,0))
 
         # Separator for stage 2
         self.sep2 = ttk.Separator(self.left_frame, orient=tk.HORIZONTAL)
@@ -161,18 +209,12 @@ class GeoRefApp:
         # Drawing mode selection
         mode_frame = ttk.Frame(self.left_frame)
         mode_frame.pack(fill='x', pady=2)
-        self.mode_var = tk.StringVar(value="lines")
-        ttk.Radiobutton(mode_frame, text="Líneas", variable=self.mode_var, value="lines").pack(side=tk.LEFT)
+        self.mode_var = tk.StringVar(value="freehand")
+        ttk.Radiobutton(mode_frame, text="Mano alzada", variable=self.mode_var, value="freehand").pack(side=tk.LEFT)
         ttk.Radiobutton(mode_frame, text="Rectángulo", variable=self.mode_var, value="rectangle").pack(side=tk.LEFT)
         
         self.btn_new_poly = ttk.Button(self.left_frame, text="Nuevo Polígono", command=self.start_polygon, state=tk.DISABLED)
         self.btn_new_poly.pack(fill='x', pady=2)
-        self.btn_close_ring = ttk.Button(self.left_frame, text="Cerrar Anillo", command=self.close_current_ring, state=tk.DISABLED)
-        self.btn_close_ring.pack(fill='x', pady=2)
-        self.btn_add_ring = ttk.Button(self.left_frame, text="Agregar Anillo", command=self.start_new_ring, state=tk.DISABLED)
-        self.btn_add_ring.pack(fill='x', pady=2)
-        self.btn_finish_poly = ttk.Button(self.left_frame, text="Finalizar Polígono", command=self.finish_current_polygon, state=tk.DISABLED)
-        self.btn_finish_poly.pack(fill='x', pady=2)
         self.btn_undo_poly = ttk.Button(self.left_frame, text="Eliminar Último", command=self.delete_last_polygon, state=tk.DISABLED)
         self.btn_undo_poly.pack(fill='x', pady=2)
         self.poly_listbox = tk.Listbox(self.left_frame, height=8)
@@ -180,6 +222,105 @@ class GeoRefApp:
         ttk.Button(self.left_frame, text="Guardar Shapefile & CSV", command=self.export_polygons, state=tk.NORMAL).pack(fill='x', pady=(8, 4))
         self.status_var = tk.StringVar(value="Listo")
         ttk.Label(self.left_frame, textvariable=self.status_var, wraplength=220, foreground='blue').pack(fill='x', pady=(10,0))
+
+    def _create_image_zoom_controls(self):
+        """Create zoom control buttons beside the image"""
+        # Title for the zoom controls
+        ttk.Label(self.zoom_buttons_frame, text="Zoom", font=('TkDefaultFont', 9, 'bold')).pack(pady=(10, 5))
+        
+        # Zoom In button with icon-like appearance
+        self.zoom_in_btn = ttk.Button(
+            self.zoom_buttons_frame, 
+            text="🔍+\nZoom In", 
+            command=self.zoom_in,
+            width=10
+        )
+        self.zoom_in_btn.pack(pady=5, fill='x')
+        
+        # Zoom Out button with icon-like appearance
+        self.zoom_out_btn = ttk.Button(
+            self.zoom_buttons_frame, 
+            text="🔍-\nZoom Out", 
+            command=self.zoom_out,
+            width=10
+        )
+        self.zoom_out_btn.pack(pady=5, fill='x')
+        
+        # Reset View button
+        self.reset_btn = ttk.Button(
+            self.zoom_buttons_frame, 
+            text="⌂\nReset", 
+            command=self.reset_view,
+            width=10
+        )
+        self.reset_btn.pack(pady=5, fill='x')
+        
+        # Pan toggle button
+        self.image_pan_btn = ttk.Button(
+            self.zoom_buttons_frame, 
+            text="✋\nPan", 
+            command=self.toggle_pan,
+            width=10
+        )
+        self.image_pan_btn.pack(pady=5, fill='x')
+        
+        # Separator
+        ttk.Separator(self.zoom_buttons_frame, orient=tk.HORIZONTAL).pack(fill='x', pady=5)
+        
+        # Navigation arrows title
+        ttk.Label(self.zoom_buttons_frame, text="Navegar", font=('TkDefaultFont', 9, 'bold')).pack(pady=(5, 2))
+        
+        # Arrow navigation buttons in cross pattern
+        # Up arrow
+        self.nav_up_btn = ttk.Button(
+            self.zoom_buttons_frame, 
+            text="↑", 
+            command=lambda: self.navigate_arrow('up'),
+            width=5
+        )
+        self.nav_up_btn.pack(pady=2)
+        
+        # Left and Right arrows in same row
+        nav_lr_frame = ttk.Frame(self.zoom_buttons_frame)
+        nav_lr_frame.pack()
+        
+        self.nav_left_btn = ttk.Button(
+            nav_lr_frame, 
+            text="←", 
+            command=lambda: self.navigate_arrow('left'),
+            width=5
+        )
+        self.nav_left_btn.pack(side=tk.LEFT, padx=2)
+        
+        self.nav_right_btn = ttk.Button(
+            nav_lr_frame, 
+            text="→", 
+            command=lambda: self.navigate_arrow('right'),
+            width=5
+        )
+        self.nav_right_btn.pack(side=tk.LEFT, padx=2)
+        
+        # Down arrow
+        self.nav_down_btn = ttk.Button(
+            self.zoom_buttons_frame, 
+            text="↓", 
+            command=lambda: self.navigate_arrow('down'),
+            width=5
+        )
+        self.nav_down_btn.pack(pady=2)
+        
+        # Separator
+        ttk.Separator(self.zoom_buttons_frame, orient=tk.HORIZONTAL).pack(fill='x', pady=5)
+        
+        # Instructions
+        instructions = ttk.Label(
+            self.zoom_buttons_frame, 
+            text="• Rueda: zoom\n• Flechas: navegar\n• Arrastrar: pan",
+            font=('TkDefaultFont', 7),
+            foreground='gray',
+            justify='center'
+        )
+        instructions.pack(pady=5)
 
     # -------------- IMAGE HANDLING --------------
     def load_image(self):
@@ -214,10 +355,22 @@ class GeoRefApp:
         self.polygons.clear()
         self.next_poly_id = 1
 
-    # -------------- CONTROL POINTS --------------
+    # -------------- CONTROL POINTS AND NAVIGATION --------------
+    def _focus_canvas(self, event):
+        """Ensure canvas has focus for keyboard events"""
+        self.canvas.get_tk_widget().focus_set()
+    
     def on_click(self, event):
         if event.inaxes != self.ax:
             return
+            
+        # Handle pan mode
+        if self.pan_mode and event.button == 1:  # Left click for panning
+            self.pan_start = (event.x, event.y)
+            self.pan_start_xlim = self.ax.get_xlim()
+            self.pan_start_ylim = self.ax.get_ylim()
+            return
+            
         if self.stage == 1:
             if self.img_array is None:
                 return
@@ -225,15 +378,14 @@ class GeoRefApp:
             self.update_points_list()
             self.redraw()
         elif self.stage == 2:
+            if self.pan_mode:
+                return  # Don't draw polygons in pan mode
+                
             self.drawing_mode = self.mode_var.get()
-            if self.drawing_mode == "lines" and self.drawing:
-                # Add point for line drawing
+            if self.drawing_mode == "freehand" and self.drawing:
+                # Start freehand drawing - mouse press
+                self.mouse_pressed = True
                 self.current_poly_pixels.append((event.xdata, event.ydata))
-                self.redraw()
-                # Check for double-click to finish polygon (or right-click in future)
-                if len(self.current_poly_pixels) >= 3:
-                    # Could add logic here to detect double-click or add finish button
-                    pass
             elif self.drawing_mode == "rectangle" and self.drawing:
                 # Start rectangle - first click
                 if self.rect_start is None:
@@ -251,7 +403,32 @@ class GeoRefApp:
         if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
             self._last_mouse_pos = (event.xdata, event.ydata)
         
-        if self.stage != 2 or not self.drawing:
+        # Handle panning
+        if self.pan_mode and self.pan_start is not None and event.button == 1:
+            dx = event.x - self.pan_start[0]
+            dy = event.y - self.pan_start[1]
+            
+            # Convert pixel movement to data coordinates
+            xlim_range = self.pan_start_xlim[1] - self.pan_start_xlim[0]
+            ylim_range = self.pan_start_ylim[1] - self.pan_start_ylim[0]
+            
+            # Get canvas size
+            canvas_width = self.canvas.get_tk_widget().winfo_width()
+            canvas_height = self.canvas.get_tk_widget().winfo_height()
+            
+            if canvas_width > 0 and canvas_height > 0:
+                dx_data = -dx * xlim_range / canvas_width
+                dy_data = dy * ylim_range / canvas_height
+                
+                new_xlim = (self.pan_start_xlim[0] + dx_data, self.pan_start_xlim[1] + dx_data)
+                new_ylim = (self.pan_start_ylim[0] + dy_data, self.pan_start_ylim[1] + dy_data)
+                
+                self.ax.set_xlim(new_xlim)
+                self.ax.set_ylim(new_ylim)
+                self.canvas.draw_idle()
+            return
+        
+        if self.stage != 2 or not self.drawing or self.pan_mode:
             return
         if event.inaxes != self.ax:
             return
@@ -259,34 +436,86 @@ class GeoRefApp:
             return
             
         self.drawing_mode = self.mode_var.get()
-        if self.drawing_mode == "lines" and self.drawing and self.current_poly_pixels:
-            # Show preview line to current mouse position
-            self.redraw()
+        if self.drawing_mode == "freehand" and self.mouse_pressed:
+            # Decimate points to avoid huge arrays
+            if not self.current_poly_pixels or self._dist(self.current_poly_pixels[-1], (event.xdata, event.ydata)) > 2:
+                self.current_poly_pixels.append((event.xdata, event.ydata))
+                self.redraw()
         elif self.drawing_mode == "rectangle" and self.rect_start:
             # Show preview of rectangle
             self.redraw()
 
     def on_release(self, event):
-        # No longer needed for lines mode, only used for rectangle mode completion
-        pass
+        # Reset pan state
+        if self.pan_mode:
+            self.pan_start = None
+            self.pan_start_xlim = None
+            self.pan_start_ylim = None
+            return
+            
+        if self.stage == 2 and self.drawing:
+            self.drawing_mode = self.mode_var.get()
+            if self.drawing_mode == "freehand" and self.mouse_pressed:
+                # Finish freehand polygon
+                self.mouse_pressed = False
+                self._finish_polygon()
+            # Rectangle mode doesn't use release event
+
+    def on_scroll(self, event):
+        """Handle mouse wheel zoom"""
+        if event.inaxes != self.ax or self.img_array is None:
+            return
+            
+        # Get mouse position in data coordinates
+        center_x, center_y = event.xdata, event.ydata
+        if center_x is None or center_y is None:
+            return
+            
+        # Zoom factor based on scroll direction
+        zoom_factor = 0.8 if event.button == 'up' else 1.25
+        
+        # Zoom around mouse position
+        self.zoom_at_point(center_x, center_y, zoom_factor)
+    
+    def on_key_press(self, event):
+        """Handle keyboard shortcuts"""
+        if event.key == '+' or event.key == '=':
+            self.zoom_in()
+        elif event.key == '-':
+            self.zoom_out()
+        elif event.key == 'p' or event.key == 'P':
+            self.toggle_pan()
+        elif event.key == 'r' or event.key == 'R':
+            self.reset_view()
+        elif event.key == 'Delete' or event.key == 'BackSpace':
+            # Delete last control point if in stage 1
+            if self.stage == 1:
+                self.delete_last_point()
+        elif event.key == 'ctrl+Delete' or (event.key == 'Delete' and 'ctrl' in str(event)):
+            # Clear all control points if in stage 1
+            if self.stage == 1:
+                self.clear_all_points()
+        # Arrow key navigation
+        elif event.key == 'up':
+            self.navigate_arrow('up')
+        elif event.key == 'down':
+            self.navigate_arrow('down')
+        elif event.key == 'left':
+            self.navigate_arrow('left')
+        elif event.key == 'right':
+            self.navigate_arrow('right')
 
     def _finish_polygon(self):
-        """Helper function to complete polygon creation - only for rectangle mode"""
+        """Helper function to complete polygon creation"""
         if len(self.current_poly_pixels) > 2:
             name = simpledialog.askstring("Nombre", "Nombre del polígono:")
             if not name:
                 name = f"Poly_{self.next_poly_id}"
             world_pts = [self.pixel_to_world(c, r) for c, r in self.current_poly_pixels]
-            # Create single-ring polygon for backward compatibility
-            poly = DigitizedPolygon(
-                name=name, 
-                pixel_rings=[list(self.current_poly_pixels)], 
-                world_rings=[world_pts], 
-                id=self.next_poly_id
-            )
+            poly = DigitizedPolygon(name=name, pixel_points=list(self.current_poly_pixels), world_points=world_pts, id=self.next_poly_id)
             self.polygons.append(poly)
             self.next_poly_id += 1
-            self.poly_listbox.insert(tk.END, f"{poly.id}: {poly.name} (1 anillo, {len(world_pts)} vtx)")
+            self.poly_listbox.insert(tk.END, f"{poly.id}: {poly.name} ({len(poly.world_points)} vtx)")
             self.status(f"Polígono '{poly.name}' creado.")
         else:
             self.status("Polígono descartado: muy pocos puntos.")
@@ -294,9 +523,6 @@ class GeoRefApp:
         self.drawing = False
         self.redraw()
         self.btn_new_poly.config(state=tk.NORMAL)
-        self.btn_close_ring.config(state=tk.DISABLED)
-        self.btn_add_ring.config(state=tk.DISABLED)
-        self.btn_finish_poly.config(state=tk.DISABLED)
 
     def assign_coord(self):
         sel = self.points_listbox.curselection()
@@ -305,14 +531,49 @@ class GeoRefApp:
             return
         idx = sel[0]
         cp = self.control_points[idx]
-        x = simpledialog.askfloat("Asignar Longitud", f"Longitud para punto {idx} (formato: -116.5833):", initialvalue=cp.x if cp.x is not None else 0.0)
+        x = simpledialog.askfloat("Coordenada X", f"X para punto {idx} (pixel col={cp.col:.1f}):", initialvalue=cp.x if cp.x is not None else 0.0)
         if x is None:
             return
-        y = simpledialog.askfloat("Asignar Latitud", f"Latitud para punto {idx} (formato: 31.8667):", initialvalue=cp.y if cp.y is not None else 0.0)
+        y = simpledialog.askfloat("Coordenada Y", f"Y para punto {idx} (pixel row={cp.row:.1f}):", initialvalue=cp.y if cp.y is not None else 0.0)
         if y is None:
             return
         cp.x, cp.y = x, y
         self.update_points_list()
+
+    def delete_last_point(self):
+        """Delete the last control point"""
+        if not self.control_points:
+            messagebox.showinfo("Sin puntos", "No hay puntos de control para borrar.")
+            return
+        
+        # Ask for confirmation
+        if messagebox.askyesno("Confirmar", f"¿Borrar el último punto de control (punto {len(self.control_points)-1})?"):
+            self.control_points.pop()
+            self.update_points_list()
+            self.redraw()
+            self.status(f"Punto de control eliminado. Quedan {len(self.control_points)} puntos.")
+            
+            # Reset transformation if we have less than 3 points
+            if len(self.control_points) < 3:
+                self.transform = None
+                self.lbl_transform.config(text="Transformación: --")
+                self.btn_to_polys.config(state=tk.DISABLED)
+
+    def clear_all_points(self):
+        """Clear all control points"""
+        if not self.control_points:
+            messagebox.showinfo("Sin puntos", "No hay puntos de control para borrar.")
+            return
+            
+        # Ask for confirmation
+        if messagebox.askyesno("Confirmar", f"¿Borrar todos los {len(self.control_points)} puntos de control?"):
+            self.control_points.clear()
+            self.transform = None
+            self.update_points_list()
+            self.redraw()
+            self.lbl_transform.config(text="Transformación: --")
+            self.btn_to_polys.config(state=tk.DISABLED)
+            self.status("Todos los puntos de control eliminados.")
 
     def import_control_csv(self):
         if not self.control_points:
@@ -335,7 +596,7 @@ class GeoRefApp:
         has_col = 'col' in rows[0] and 'row' in rows[0]
         has_xy = 'x' in rows[0] and 'y' in rows[0]
         if not has_xy:
-            messagebox.showerror("Error", "CSV debe contener columnas x,y (longitud,latitud) y opcionalmente col,row")
+            messagebox.showerror("Error", "CSV debe contener columnas x,y (y opcionalmente col,row)")
             return
         if has_col:
             # Map by (closest) pixel coordinate if near existing control points
@@ -421,126 +682,22 @@ class GeoRefApp:
         if self.transform is None:
             messagebox.showinfo("Primero", "Calcule la transformación.")
             return
-        
-        # Ask for polygon name at the beginning
-        name = simpledialog.askstring("Nombre", "Nombre del polígono:")
-        if not name:
-            name = f"Poly_{self.next_poly_id}"
-        
+        if self.pan_mode:
+            messagebox.showinfo("Modo Pan", "Desactive el modo Pan antes de dibujar polígonos.")
+            return
+            
         self.drawing = True
         self.mouse_pressed = False
         self.rect_start = None
         self.current_poly_pixels.clear()
-        self.current_polygon_rings.clear()
-        self.current_polygon_name = name
         self.drawing_mode = self.mode_var.get()
         
-        if self.drawing_mode == "lines":
-            self.status(f"Dibujando '{name}': clic para puntos. 'Cerrar Anillo' para finalizar anillo actual.")
-            self.btn_close_ring.config(state=tk.NORMAL)
-            self.btn_add_ring.config(state=tk.DISABLED)
-            self.btn_finish_poly.config(state=tk.NORMAL)
+        if self.drawing_mode == "freehand":
+            self.status("Dibujando polígono: mantenga presionado y mueva el mouse (libere para finalizar).")
         else:  # rectangle
             self.status("Dibujando rectángulo: haga click en esquina inicial, luego en esquina opuesta.")
-            self.btn_close_ring.config(state=tk.DISABLED)
-            self.btn_add_ring.config(state=tk.DISABLED)
-            self.btn_finish_poly.config(state=tk.DISABLED)
         
         self.btn_new_poly.config(state=tk.DISABLED)
-        self.redraw()
-
-    def close_current_ring(self):
-        """Close the current ring and add it to the polygon"""
-        if not self.drawing or self.drawing_mode != "lines":
-            return
-        if len(self.current_poly_pixels) < 3:
-            self.status("Necesita al menos 3 puntos para cerrar un anillo.")
-            return
-        
-        # Add current ring to polygon rings
-        self.current_polygon_rings.append(list(self.current_poly_pixels))
-        self.current_poly_pixels.clear()
-        
-        # Enable adding more rings
-        self.btn_add_ring.config(state=tk.NORMAL)
-        self.btn_close_ring.config(state=tk.DISABLED)
-        
-        self.status(f"Anillo cerrado. Total anillos: {len(self.current_polygon_rings)}. Puede agregar más anillos o finalizar.")
-        self.redraw()
-
-    def start_new_ring(self):
-        """Start drawing a new ring for the current polygon"""
-        if not self.drawing:
-            return
-        
-        self.current_poly_pixels.clear()
-        self.btn_add_ring.config(state=tk.DISABLED)
-        self.btn_close_ring.config(state=tk.NORMAL)
-        
-        self.status(f"Dibujando nuevo anillo para '{self.current_polygon_name}': clic para agregar puntos.")
-        self.redraw()
-
-    def finish_current_polygon(self):
-        """Finish the current polygon being drawn in lines mode"""
-        if not self.drawing:
-            return
-        
-        # If there's a current ring being drawn, ask to close it
-        if self.current_poly_pixels and len(self.current_poly_pixels) >= 3:
-            result = messagebox.askyesnocancel("Anillo abierto", 
-                "Hay un anillo abierto. ¿Desea cerrarlo antes de finalizar?")
-            if result is True:  # Yes
-                self.close_current_ring()
-            elif result is None:  # Cancel
-                return
-            # If No (False), continue without closing current ring
-        
-        if not self.current_polygon_rings:
-            self.status("No hay anillos cerrados para guardar.")
-            return
-        
-        self._save_multipolygon()
-
-    def _save_multipolygon(self):
-        """Save the current multi-ring polygon"""
-        if not self.current_polygon_rings:
-            return
-        
-        # Convert all rings to world coordinates
-        world_rings = []
-        for ring in self.current_polygon_rings:
-            world_ring = [self.pixel_to_world(c, r) for c, r in ring]
-            world_rings.append(world_ring)
-        
-        # Create polygon with multiple rings
-        poly = DigitizedPolygon(
-            name=self.current_polygon_name,
-            pixel_rings=list(self.current_polygon_rings),
-            world_rings=world_rings,
-            id=self.next_poly_id
-        )
-        
-        self.polygons.append(poly)
-        self.next_poly_id += 1
-        
-        # Update UI
-        total_vertices = sum(len(ring) for ring in world_rings)
-        ring_count = len(world_rings)
-        self.poly_listbox.insert(tk.END, f"{poly.id}: {poly.name} ({ring_count} anillos, {total_vertices} vtx)")
-        self.status(f"Polígono '{poly.name}' guardado con {ring_count} anillos.")
-        
-        # Reset state
-        self.current_poly_pixels.clear()
-        self.current_polygon_rings.clear()
-        self.current_polygon_name = None
-        self.drawing = False
-        
-        # Reset button states
-        self.btn_new_poly.config(state=tk.NORMAL)
-        self.btn_close_ring.config(state=tk.DISABLED)
-        self.btn_add_ring.config(state=tk.DISABLED)
-        self.btn_finish_poly.config(state=tk.DISABLED)
-        
         self.redraw()
 
     def delete_last_polygon(self):
@@ -569,19 +726,13 @@ class GeoRefApp:
                 w.autoBalance = 1
                 w.field('ID', 'N', decimal=0)
                 w.field('NAME', 'C')
-                w.field('RINGS', 'N', decimal=0)  # Number of rings
                 for poly in self.polygons:
-                    # Handle multiple rings
-                    all_rings = []
-                    for ring in poly.world_rings:
-                        # Ensure closed ring
-                        if ring and ring[0] != ring[-1]:
-                            ring = ring + [ring[0]]
-                        all_rings.append(ring)
-                    
-                    if all_rings:
-                        w.poly(all_rings)
-                        w.record(poly.id, poly.name, len(all_rings))
+                    # Ensure closed ring
+                    pts = poly.world_points
+                    if pts[0] != pts[-1]:
+                        pts = pts + [pts[0]]
+                    w.poly([pts])
+                    w.record(poly.id, poly.name)
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo escribir shapefile: {e}")
             return
@@ -589,11 +740,10 @@ class GeoRefApp:
         try:
             with open(csv_path, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['poly_id','name','ring_id','vertex_index','x','y'])
+                writer.writerow(['poly_id','name','vertex_index','x','y'])
                 for poly in self.polygons:
-                    for ring_idx, ring in enumerate(poly.world_rings):
-                        for vertex_idx, (x, y) in enumerate(ring):
-                            writer.writerow([poly.id, poly.name, ring_idx, vertex_idx, x, y])
+                    for i,(x,y) in enumerate(poly.world_points):
+                        writer.writerow([poly.id, poly.name, i, x, y])
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo escribir CSV: {e}")
             return
@@ -626,9 +776,9 @@ class GeoRefApp:
         self.points_listbox.delete(0, tk.END)
         for i, cp in enumerate(self.control_points):
             if cp.is_complete:
-                self.points_listbox.insert(tk.END, f"{i}: col={cp.col:.1f} row={cp.row:.1f} -> Lon={cp.x:.6f} Lat={cp.y:.6f}")
+                self.points_listbox.insert(tk.END, f"{i}: col={cp.col:.1f} row={cp.row:.1f} -> X={cp.x:.3f} Y={cp.y:.3f}")
             else:
-                self.points_listbox.insert(tk.END, f"{i}: col={cp.col:.1f} row={cp.row:.1f} -> (sin coordenadas)")
+                self.points_listbox.insert(tk.END, f"{i}: col={cp.col:.1f} row={cp.row:.1f} -> (sin coord)")
         self.redraw()
 
     def redraw(self):
@@ -641,48 +791,21 @@ class GeoRefApp:
         for cp in self.control_points:
             color = 'lime' if cp.is_complete else 'yellow'
             self.ax.plot(cp.col, cp.row, 'o', color=color, markersize=6)
-        # Draw polygons (all rings)
+        # Draw polygons
         for poly in self.polygons:
-            # Draw all rings for each polygon
-            for ring_idx, ring in enumerate(poly.pixel_rings):
-                if not ring:
-                    continue
-                xs = [p[0] for p in ring] + [ring[0][0]]  # Close the ring
-                ys = [p[1] for p in ring] + [ring[0][1]]
-                color = 'red' if ring_idx == 0 else 'darkred'  # Different colors for outer/inner rings
-                self.ax.plot(xs, ys, '-', color=color, linewidth=1.5)
-            
-            # Label at centroid of first ring
-            if poly.pixel_rings and poly.pixel_rings[0]:
-                first_ring = poly.pixel_rings[0]
-                cx = np.mean([p[0] for p in first_ring])
-                cy = np.mean([p[1] for p in first_ring])
-                self.ax.text(cx, cy, poly.name, color='white', fontsize=8, ha='center', va='center')
-        
-        # Draw completed rings of current polygon being drawn
-        for ring_idx, ring in enumerate(self.current_polygon_rings):
-            if not ring:
-                continue
-            xs = [p[0] for p in ring] + [ring[0][0]]
-            ys = [p[1] for p in ring] + [ring[0][1]]
-            self.ax.plot(xs, ys, '-', color='orange', linewidth=2, alpha=0.8)
-        
-        # Current drawing (active ring)
+            pix = poly.pixel_points
+            xs = [p[0] for p in pix] + [pix[0][0]]
+            ys = [p[1] for p in pix] + [pix[0][1]]
+            self.ax.plot(xs, ys, '-', color='red', linewidth=1.5)
+            # Label roughly at centroid of pixel points
+            cx = np.mean([p[0] for p in pix])
+            cy = np.mean([p[1] for p in pix])
+            self.ax.text(cx, cy, poly.name, color='white', fontsize=8, ha='center', va='center')
+        # Current drawing
         if self.drawing and self.current_poly_pixels:
             xs = [p[0] for p in self.current_poly_pixels]
             ys = [p[1] for p in self.current_poly_pixels]
-            # Draw the current polygon lines
-            if len(xs) > 1:
-                self.ax.plot(xs, ys, 'o-', color='cyan', linewidth=2, markersize=4)
-            else:
-                self.ax.plot(xs, ys, 'o', color='cyan', markersize=6)
-            
-            # Show preview line to mouse cursor for lines mode
-            if self.drawing_mode == "lines" and hasattr(self, '_last_mouse_pos') and self._last_mouse_pos:
-                if len(self.current_poly_pixels) > 0:
-                    last_x, last_y = self.current_poly_pixels[-1]
-                    mouse_x, mouse_y = self._last_mouse_pos
-                    self.ax.plot([last_x, mouse_x], [last_y, mouse_y], '--', color='cyan', alpha=0.7)
+            self.ax.plot(xs, ys, '-', color='cyan')
         
         # Rectangle preview
         if self.drawing and self.drawing_mode == "rectangle" and self.rect_start:
@@ -706,6 +829,122 @@ class GeoRefApp:
     @staticmethod
     def _dist(a: Tuple[float,float], b: Tuple[float,float]) -> float:
         return math.hypot(a[0]-b[0], a[1]-b[1])
+
+    def zoom_in(self, factor: float = 0.8):
+        """Zoom in centered on current view"""
+        if self.ax.get_images():
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            cx, cy = np.mean(xlim), np.mean(ylim)
+            self.zoom_at_point(cx, cy, factor)
+
+    def zoom_out(self, factor: float = 1.25):
+        """Zoom out centered on current view"""
+        if self.ax.get_images():
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            cx, cy = np.mean(xlim), np.mean(ylim)
+            self.zoom_at_point(cx, cy, factor)
+            
+    def zoom_at_point(self, center_x: float, center_y: float, factor: float):
+        """Zoom in/out centered at a specific point"""
+        if not self.ax.get_images():
+            return
+            
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        
+        # Calculate new ranges
+        new_width = (xlim[1] - xlim[0]) * factor
+        new_height = (ylim[1] - ylim[0]) * factor
+        
+        # Calculate new limits centered on the specified point
+        new_xlim = (center_x - new_width / 2, center_x + new_width / 2)
+        new_ylim = (center_y - new_height / 2, center_y + new_height / 2)
+        
+        # Apply zoom limits to prevent zooming too far out
+        if self.img_array is not None:
+            max_width = self.img_array.shape[1] * 2  # Allow 2x image size
+            max_height = self.img_array.shape[0] * 2
+            
+            if new_width > max_width:
+                center_x = np.clip(center_x, max_width/2, self.img_array.shape[1] - max_width/2)
+                new_xlim = (center_x - max_width / 2, center_x + max_width / 2)
+            if new_height > max_height:
+                center_y = np.clip(center_y, max_height/2, self.img_array.shape[0] - max_height/2)
+                new_ylim = (center_y - max_height / 2, center_y + max_height / 2)
+        
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
+
+    def reset_view(self):
+        """Reset view to show entire image"""
+        if self.img_array is not None:
+            self.ax.set_xlim(0, self.img_array.shape[1])
+            self.ax.set_ylim(self.img_array.shape[0], 0)  # Invert Y for image coordinates
+            self.canvas.draw_idle()
+            if self.pan_mode:
+                self.toggle_pan()  # Turn off pan mode when resetting view
+
+    def navigate_arrow(self, direction: str):
+        """Navigate the image using arrow directions"""
+        if not self.ax.get_images():
+            return
+            
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        
+        # Calculate step size as 10% of current view range
+        x_step = (xlim[1] - xlim[0]) * 0.1
+        y_step = (ylim[1] - ylim[0]) * 0.1
+        
+        # Calculate new limits based on direction (up/down inverted for intuitive navigation)
+        if direction == 'up':
+            # Moving up should show more of the upper part of the image
+            new_ylim = (ylim[0] + y_step, ylim[1] + y_step)
+            new_xlim = xlim
+        elif direction == 'down':
+            # Moving down should show more of the lower part of the image
+            new_ylim = (ylim[0] - y_step, ylim[1] - y_step)
+            new_xlim = xlim
+        elif direction == 'left':
+            new_xlim = (xlim[0] - x_step, xlim[1] - x_step)
+            new_ylim = ylim
+        elif direction == 'right':
+            new_xlim = (xlim[0] + x_step, xlim[1] + x_step)
+            new_ylim = ylim
+        else:
+            return
+            
+        # Apply the navigation
+        self.ax.set_xlim(new_xlim)
+        self.ax.set_ylim(new_ylim)
+        self.canvas.draw_idle()
+
+    def toggle_pan(self):
+        """Toggle pan mode on/off"""
+        self.pan_mode = not self.pan_mode
+        if self.pan_mode:
+            # Update left panel pan button
+            self.pan_button.config(text="Pan (Activo)")
+            self.pan_button.state(['pressed'])
+            # Update image side pan button
+            self.image_pan_btn.config(text="✋\nPan ON")
+            self.image_pan_btn.state(['pressed'])
+            self.status("Modo Pan activado. Arrastre para navegar por la imagen.")
+        else:
+            # Update left panel pan button
+            self.pan_button.config(text="Pan (P)")
+            self.pan_button.state(['!pressed'])
+            # Update image side pan button
+            self.image_pan_btn.config(text="✋\nPan")
+            self.image_pan_btn.state(['!pressed'])
+            self.status("Modo Pan desactivado.")
+            # Reset pan state
+            self.pan_start = None
+            self.pan_start_xlim = None
+            self.pan_start_ylim = None
 
 
 def main():
