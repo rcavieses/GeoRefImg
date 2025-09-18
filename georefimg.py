@@ -93,18 +93,20 @@ class GeoRefApp:
         self.stage = 1  # 1 puntos, 2 polígonos
         self.drawing = False
         self.drawing_mode = "freehand"  # "freehand" or "rectangle"
-        self.mouse_pressed = False
         self.rect_start = None
         self._last_mouse_pos = None
         self.current_poly_pixels = []
+        self.current_group_pixels = []  # Lista de polígonos en el grupo actual
         self.polygons = []
         self.next_poly_id = 1
+        self.current_group_name = None
         
         # Navigation control variables
         self.pan_mode = False
         self.pan_start = None
         self.pan_start_xlim = None
         self.pan_start_ylim = None
+        self._ignore_next_click = False  # Para evitar clicks espurios
 
         self._build_ui()
 
@@ -197,7 +199,7 @@ class GeoRefApp:
         ttk.Button(zoom_row2, text="Reset (R)", command=self.reset_view).pack(side=tk.LEFT, expand=True, fill='x', padx=(2,0))
         
         # Navigation instructions
-        nav_info = ttk.Label(zoom_frame, text="• Rueda del ratón: Zoom\n• Arrastrar: Pan (modo Pan activo)\n• Teclas: +/- zoom, P pan, R reset\n• Flechas ↑↓←→: navegar imagen\n• Del/Backspace: borrar último punto", 
+        nav_info = ttk.Label(zoom_frame, text="• Rueda del ratón: Zoom\n• Arrastrar: Pan (modo Pan activo)\n• Teclas: +/- zoom, P pan, R reset\n• Flechas ↑↓←→: navegar imagen\n• Del/Backspace: borrar último punto\n• Enter: finalizar polígono, Esc: cancelar", 
                             font=('TkDefaultFont', 8), foreground='gray')
         nav_info.pack(fill='x', pady=(4,0))
 
@@ -215,6 +217,8 @@ class GeoRefApp:
         
         self.btn_new_poly = ttk.Button(self.left_frame, text="Nuevo Polígono", command=self.start_polygon, state=tk.DISABLED)
         self.btn_new_poly.pack(fill='x', pady=2)
+        self.btn_finish_poly = ttk.Button(self.left_frame, text="Finalizar Polígono", command=self._finish_polygon_button, state=tk.DISABLED)
+        self.btn_finish_poly.pack(fill='x', pady=2)
         self.btn_undo_poly = ttk.Button(self.left_frame, text="Eliminar Último", command=self.delete_last_polygon, state=tk.DISABLED)
         self.btn_undo_poly.pack(fill='x', pady=2)
         self.poly_listbox = tk.Listbox(self.left_frame, height=8)
@@ -361,7 +365,17 @@ class GeoRefApp:
         self.canvas.get_tk_widget().focus_set()
     
     def on_click(self, event):
+        # Verificar que el click sea dentro del área de la imagen
         if event.inaxes != self.ax:
+            return
+        
+        # Verificar que las coordenadas sean válidas (dentro de la imagen)
+        if event.xdata is None or event.ydata is None:
+            return
+        
+        # Ignorar click si está marcado para ignorar
+        if self._ignore_next_click:
+            self._ignore_next_click = False
             return
             
         # Handle pan mode
@@ -383,9 +397,19 @@ class GeoRefApp:
                 
             self.drawing_mode = self.mode_var.get()
             if self.drawing_mode == "freehand" and self.drawing:
-                # Start freehand drawing - mouse press
-                self.mouse_pressed = True
+                # Add vertex to polygon - pero solo si realmente estamos dibujando
                 self.current_poly_pixels.append((event.xdata, event.ydata))
+                self.redraw()
+                # Habilitar el botón de finalizar cuando tenemos al menos 3 puntos
+                if len(self.current_poly_pixels) >= 3:
+                    self.btn_finish_poly.config(state=tk.NORMAL)
+                # Si es el primer punto, muestra instrucciones
+                if len(self.current_poly_pixels) == 1:
+                    self.status("Click para agregar vértices. Necesita al menos 3 vértices para crear un polígono.")
+                elif len(self.current_poly_pixels) < 3:
+                    self.status(f"Vértice {len(self.current_poly_pixels)} agregado. Necesita {3-len(self.current_poly_pixels)} vértices más.")
+                else:
+                    self.status(f"Vértice {len(self.current_poly_pixels)} agregado. Use el botón 'Finalizar Polígono' cuando termine.")
             elif self.drawing_mode == "rectangle" and self.drawing:
                 # Start rectangle - first click
                 if self.rect_start is None:
@@ -402,6 +426,9 @@ class GeoRefApp:
     def on_motion(self, event):
         if event.inaxes == self.ax and event.xdata is not None and event.ydata is not None:
             self._last_mouse_pos = (event.xdata, event.ydata)
+            # Si estamos dibujando, actualizar la vista para mostrar la línea de vista previa
+            if self.drawing and self.stage == 2:
+                self.redraw()
         
         # Handle panning
         if self.pan_mode and self.pan_start is not None and event.button == 1:
@@ -428,7 +455,7 @@ class GeoRefApp:
                 self.canvas.draw_idle()
             return
         
-        if self.stage != 2 or not self.drawing or self.pan_mode:
+        if self.stage != 2 or not self.drawing:
             return
         if event.inaxes != self.ax:
             return
@@ -436,11 +463,9 @@ class GeoRefApp:
             return
             
         self.drawing_mode = self.mode_var.get()
-        if self.drawing_mode == "freehand" and self.mouse_pressed:
-            # Decimate points to avoid huge arrays
-            if not self.current_poly_pixels or self._dist(self.current_poly_pixels[-1], (event.xdata, event.ydata)) > 2:
-                self.current_poly_pixels.append((event.xdata, event.ydata))
-                self.redraw()
+        # Para el modo a mano alzada, solo actualizamos la vista previa
+        if self.drawing_mode == "freehand" and self.current_poly_pixels:
+            self.redraw()  # Esto mostrará la línea provisional al punto actual
         elif self.drawing_mode == "rectangle" and self.rect_start:
             # Show preview of rectangle
             self.redraw()
@@ -453,13 +478,9 @@ class GeoRefApp:
             self.pan_start_ylim = None
             return
             
-        if self.stage == 2 and self.drawing:
-            self.drawing_mode = self.mode_var.get()
-            if self.drawing_mode == "freehand" and self.mouse_pressed:
-                # Finish freehand polygon
-                self.mouse_pressed = False
-                self._finish_polygon()
-            # Rectangle mode doesn't use release event
+        # No automatic polygon finishing on mouse release for freehand mode
+        # Users must use the "Finalizar Polígono" button
+        # Rectangle mode handles completion automatically in on_click
 
     def on_scroll(self, event):
         """Handle mouse wheel zoom"""
@@ -495,6 +516,20 @@ class GeoRefApp:
             # Clear all control points if in stage 1
             if self.stage == 1:
                 self.clear_all_points()
+        elif event.key == 'Enter' or event.key == 'return':
+            # Finalizar polígono en etapa 2 si estamos dibujando
+            if self.stage == 2 and self.drawing and len(self.current_poly_pixels) >= 3:
+                self._finish_polygon()
+        elif event.key == 'escape':
+            # Cancelar dibujo actual
+            if self.stage == 2 and self.drawing:
+                self.current_poly_pixels.clear()
+                self.drawing = False
+                self.rect_start = None
+                self.btn_new_poly.config(state=tk.NORMAL)
+                self.btn_finish_poly.config(state=tk.DISABLED)
+                self.status("Dibujo de polígono cancelado.")
+                self.redraw()
         # Arrow key navigation
         elif event.key == 'up':
             self.navigate_arrow('up')
@@ -507,22 +542,130 @@ class GeoRefApp:
 
     def _finish_polygon(self):
         """Helper function to complete polygon creation"""
-        if len(self.current_poly_pixels) > 2:
-            name = simpledialog.askstring("Nombre", "Nombre del polígono:")
+        # Prevenir procesamiento múltiple
+        if not self.drawing or len(self.current_poly_pixels) == 0:
+            return
+            
+        # Deshabilitar temporalmente el dibujo para evitar clicks adicionales
+        was_drawing = self.drawing
+        self.drawing = False
+        
+        # Store current view limits
+        current_xlim = self.ax.get_xlim()
+        current_ylim = self.ax.get_ylim()
+        
+        # Verificar si hay suficientes puntos para formar un polígono
+        if len(self.current_poly_pixels) < 3:
+            messagebox.showinfo("Aviso", "Se necesitan al menos 3 vértices para crear un polígono.")
+            # Restaurar el estado de dibujo si no había suficientes puntos
+            self.drawing = was_drawing
+            return
+        
+        # Cerrar el polígono actual
+        if self.current_poly_pixels[0] != self.current_poly_pixels[-1]:
+            self.current_poly_pixels.append(self.current_poly_pixels[0])
+        
+        # Si es el primer polígono del grupo, pedir nombre
+        if self.current_group_name is None:
+            name = self._ask_polygon_name()
             if not name:
-                name = f"Poly_{self.next_poly_id}"
-            world_pts = [self.pixel_to_world(c, r) for c, r in self.current_poly_pixels]
-            poly = DigitizedPolygon(name=name, pixel_points=list(self.current_poly_pixels), world_points=world_pts, id=self.next_poly_id)
+                name = f"Polígono {self.next_poly_id}"
+            self.current_group_name = name
+        
+        # Agregar el polígono actual al grupo
+        self.current_group_pixels.append(list(self.current_poly_pixels))
+        self.current_poly_pixels.clear()
+        
+        # Preguntar si desea agregar otro polígono al grupo
+        wants_more = messagebox.askyesno("Grupo de Polígonos", 
+                              f"Polígono agregado al grupo '{self.current_group_name}'\n\n¿Desea agregar otro polígono a este grupo?")
+        
+        if wants_more:
+            # Continuar dibujando en el mismo grupo
+            self.status(f"Dibuje el siguiente polígono para el grupo '{self.current_group_name}'")
+            self.drawing = True  # Permitir continuar dibujando
+            self.btn_new_poly.config(state=tk.DISABLED)
+            self.btn_finish_poly.config(state=tk.NORMAL)
+            return
+        
+        # Finalizar el grupo - crear polígono final
+        if len(self.current_group_pixels) == 1:
+            # Solo un polígono - crear como polígono individual
+            poly_pixels = self.current_group_pixels[0]
+            world_pts = [self.pixel_to_world(c, r) for c, r in poly_pixels]
+            
+            # Optional shapely cleanup
+            if ShapelyPolygon is not None:
+                try:
+                    poly_geom = ShapelyPolygon(world_pts)
+                    if not poly_geom.is_valid:
+                        clean = poly_geom.buffer(0)
+                        if clean.type == 'MultiPolygon':
+                            clean = max(clean.geoms, key=lambda p: p.area)
+                        world_pts = list(clean.exterior.coords)
+                        # Update pixel points by inverse transform
+                        poly_pixels = []
+                        for wx, wy in world_pts:
+                            col, row = self.world_to_pixel(wx, wy)
+                            poly_pixels.append((col, row))
+                except Exception as e:
+                    messagebox.showwarning("Aviso", f"No se pudo limpiar el polígono: {e}")
+            
+            # Crear polígono individual
+            poly = DigitizedPolygon(
+                name=self.current_group_name,
+                pixel_points=poly_pixels,
+                world_points=world_pts,
+                id=self.next_poly_id
+            )
             self.polygons.append(poly)
             self.next_poly_id += 1
-            self.poly_listbox.insert(tk.END, f"{poly.id}: {poly.name} ({len(poly.world_points)} vtx)")
-            self.status(f"Polígono '{poly.name}' creado.")
+            self.update_polygons_list()
+            self.status(f"Polígono '{self.current_group_name}' creado.")
         else:
-            self.status("Polígono descartado: muy pocos puntos.")
+            # Múltiples polígonos - crear como grupo
+            group_world_points = []
+            for poly_pixels in self.current_group_pixels:
+                world_pts = [self.pixel_to_world(c, r) for c, r in poly_pixels]
+                group_world_points.append(world_pts)
+            
+            # Crear polígono con múltiples partes (grupo)
+            poly = DigitizedPolygon(
+                name=self.current_group_name,
+                pixel_points=list(self.current_group_pixels),
+                world_points=group_world_points,
+                id=self.next_poly_id
+            )
+            self.polygons.append(poly)
+            self.next_poly_id += 1
+            self.update_polygons_list()
+            self.status(f"Grupo de polígonos '{self.current_group_name}' creado con {len(self.current_group_pixels)} partes.")
+        
+        # Limpiar variables del grupo
+        self.current_group_pixels.clear()
+        self.current_group_name = None
+        
         self.current_poly_pixels.clear()
         self.drawing = False
+        self.rect_start = None
+        
+        # Redraw and restore view limits
         self.redraw()
+        self.ax.set_xlim(current_xlim)
+        self.ax.set_ylim(current_ylim)
+        self.canvas.draw_idle()
+        
+        # Restaurar estado de botones
         self.btn_new_poly.config(state=tk.NORMAL)
+        self.btn_finish_poly.config(state=tk.DISABLED)
+
+    def _finish_polygon_button(self):
+        """Función específica para el botón de finalizar polígono que evita conflictos con eventos de mouse"""
+        # Marcar para ignorar el siguiente click para evitar puntos espurios
+        self._ignore_next_click = True
+        # Usar after() para ejecutar la función con un pequeño retardo
+        # esto evita que el click del botón interfiera con el canvas
+        self.root.after(10, self._finish_polygon)
 
     def assign_coord(self):
         sel = self.points_listbox.curselection()
@@ -687,18 +830,20 @@ class GeoRefApp:
             return
             
         self.drawing = True
-        self.mouse_pressed = False
         self.rect_start = None
         self.current_poly_pixels.clear()
         self.drawing_mode = self.mode_var.get()
         
         if self.drawing_mode == "freehand":
-            self.status("Dibujando polígono: mantenga presionado y mueva el mouse (libere para finalizar).")
+            if self.current_group_name:
+                self.status(f"Click para añadir vértices al grupo '{self.current_group_name}'.")
+            else:
+                self.status("Click para añadir vértices al nuevo polígono.")
         else:  # rectangle
-            self.status("Dibujando rectángulo: haga click en esquina inicial, luego en esquina opuesta.")
+            self.status("Dibujando rectángulo: click en esquina inicial, luego en esquina opuesta.")
         
         self.btn_new_poly.config(state=tk.DISABLED)
-        self.redraw()
+        self.btn_finish_poly.config(state=tk.DISABLED)  # Se habilitará cuando se agregue el primer punto
 
     def delete_last_polygon(self):
         if not self.polygons:
@@ -727,12 +872,27 @@ class GeoRefApp:
                 w.field('ID', 'N', decimal=0)
                 w.field('NAME', 'C')
                 for poly in self.polygons:
-                    # Ensure closed ring
-                    pts = poly.world_points
-                    if pts[0] != pts[-1]:
-                        pts = pts + [pts[0]]
-                    w.poly([pts])
-                    w.record(poly.id, poly.name)
+                    # Verificar si es un grupo de polígonos o un polígono individual
+                    # Un grupo tiene world_points como lista de listas, un individual como lista simple
+                    if (isinstance(poly.world_points, list) and 
+                        len(poly.world_points) > 0 and 
+                        isinstance(poly.world_points[0], list)):  # Grupo de polígonos
+                        # Cada polígono en el grupo es una parte del mismo registro
+                        parts = []
+                        for part in poly.world_points:
+                            # Ensure each part is closed
+                            if part[0] != part[-1]:
+                                part = part + [part[0]]
+                            parts.append(part)
+                        w.poly(parts)  # Múltiples partes = múltiples polígonos en el mismo registro
+                        w.record(poly.id, poly.name)
+                    else:  # Polígono individual
+                        # Ensure closed ring
+                        pts = poly.world_points
+                        if pts[0] != pts[-1]:
+                            pts = pts + [pts[0]]
+                        w.poly([pts])
+                        w.record(poly.id, poly.name)
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo escribir shapefile: {e}")
             return
@@ -742,8 +902,17 @@ class GeoRefApp:
                 writer = csv.writer(f)
                 writer.writerow(['poly_id','name','vertex_index','x','y'])
                 for poly in self.polygons:
-                    for i,(x,y) in enumerate(poly.world_points):
-                        writer.writerow([poly.id, poly.name, i, x, y])
+                    # Verificar si es un grupo de polígonos o un polígono individual
+                    if (isinstance(poly.world_points, list) and 
+                        len(poly.world_points) > 0 and 
+                        isinstance(poly.world_points[0], list)):  # Grupo de polígonos
+                        # Para grupos, escribir cada parte con un índice de parte
+                        for part_idx, part in enumerate(poly.world_points):
+                            for vertex_idx, (x, y) in enumerate(part):
+                                writer.writerow([poly.id, poly.name, f"part{part_idx}_v{vertex_idx}", x, y])
+                    else:  # Polígono individual
+                        for i, (x, y) in enumerate(poly.world_points):
+                            writer.writerow([poly.id, poly.name, i, x, y])
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo escribir CSV: {e}")
             return
@@ -781,31 +950,93 @@ class GeoRefApp:
                 self.points_listbox.insert(tk.END, f"{i}: col={cp.col:.1f} row={cp.row:.1f} -> (sin coord)")
         self.redraw()
 
+    def update_polygons_list(self):
+        """Update the polygons listbox with current polygons"""
+        self.poly_listbox.delete(0, tk.END)
+        for poly in self.polygons:
+            vertex_count = len(poly.world_points)
+            if vertex_count > 0 and poly.world_points[0] == poly.world_points[-1]:
+                vertex_count -= 1  # Don't count the closing vertex twice
+            self.poly_listbox.insert(tk.END, f"{poly.id}: {poly.name} ({vertex_count} vtx)")
+
     def redraw(self):
         if self.img_array is None:
             return
+            
+        # Store current view limits if they exist
+        try:
+            current_xlim = self.ax.get_xlim()
+            current_ylim = self.ax.get_ylim()
+            has_limits = True
+        except:
+            has_limits = False
+            
         self.ax.clear()
         self.ax.imshow(self.img_array)
         self.ax.set_axis_off()
+        
         # Draw control points
         for cp in self.control_points:
             color = 'lime' if cp.is_complete else 'yellow'
             self.ax.plot(cp.col, cp.row, 'o', color=color, markersize=6)
-        # Draw polygons
+            
+        # Draw saved polygons
         for poly in self.polygons:
-            pix = poly.pixel_points
-            xs = [p[0] for p in pix] + [pix[0][0]]
-            ys = [p[1] for p in pix] + [pix[0][1]]
-            self.ax.plot(xs, ys, '-', color='red', linewidth=1.5)
-            # Label roughly at centroid of pixel points
-            cx = np.mean([p[0] for p in pix])
-            cy = np.mean([p[1] for p in pix])
-            self.ax.text(cx, cy, poly.name, color='white', fontsize=8, ha='center', va='center')
+            # Verificar si es un grupo de polígonos o un polígono individual
+            # Un grupo tiene pixel_points como lista de listas, un individual como lista de tuplas
+            if (isinstance(poly.pixel_points, list) and 
+                len(poly.pixel_points) > 0 and 
+                isinstance(poly.pixel_points[0], list)):  # Grupo de polígonos
+                for pix in poly.pixel_points:
+                    xs = [p[0] for p in pix]
+                    ys = [p[1] for p in pix]
+                    self.ax.plot(xs, ys, '-', color='red', linewidth=1.5)
+                # Label en el centroide del primer polígono del grupo
+                first_poly = poly.pixel_points[0]
+                cx = np.mean([p[0] for p in first_poly])
+                cy = np.mean([p[1] for p in first_poly])
+                self.ax.text(cx, cy, poly.name, color='white', fontsize=8, ha='center', va='center',
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
+            else:  # Polígono individual
+                pix = poly.pixel_points
+                # Asegurar que esté cerrado para la visualización
+                xs = [p[0] for p in pix]
+                ys = [p[1] for p in pix]
+                if pix[0] != pix[-1]:
+                    xs.append(pix[0][0])
+                    ys.append(pix[0][1])
+                self.ax.plot(xs, ys, '-', color='red', linewidth=1.5)
+                cx = np.mean([p[0] for p in pix])
+                cy = np.mean([p[1] for p in pix])
+                self.ax.text(cx, cy, poly.name, color='white', fontsize=8, ha='center', va='center',
+                           bbox=dict(boxstyle="round,pad=0.3", facecolor='red', alpha=0.7))
+        
+        # Draw current group's completed polygons
+        for pix in self.current_group_pixels:
+            xs = [p[0] for p in pix]
+            ys = [p[1] for p in pix]
+            self.ax.plot(xs, ys, '-', color='orange', linewidth=1.5)
         # Current drawing
         if self.drawing and self.current_poly_pixels:
+            # Dibuja los puntos y líneas del polígono actual
             xs = [p[0] for p in self.current_poly_pixels]
             ys = [p[1] for p in self.current_poly_pixels]
-            self.ax.plot(xs, ys, '-', color='cyan')
+            # Dibuja los vértices como puntos
+            self.ax.plot(xs, ys, 'o', color='cyan', markersize=4)
+            # Dibuja las líneas entre vértices
+            self.ax.plot(xs, ys, '-', color='cyan', linewidth=1)
+            
+            # Si estamos en modo mano alzada y tenemos al menos un punto,
+            # dibuja una línea provisional desde el último punto hasta la posición actual del mouse
+            if self.drawing_mode == "freehand" and self._last_mouse_pos and len(self.current_poly_pixels) > 0:
+                last_x, last_y = self.current_poly_pixels[-1]
+                mouse_x, mouse_y = self._last_mouse_pos
+                self.ax.plot([last_x, mouse_x], [last_y, mouse_y], '--', color='cyan', alpha=0.5)
+                
+                # Si tenemos más de 2 puntos, también mostramos una línea punteada al primer punto
+                if len(self.current_poly_pixels) > 2:
+                    first_x, first_y = self.current_poly_pixels[0]
+                    self.ax.plot([mouse_x, first_x], [mouse_y, first_y], '--', color='cyan', alpha=0.3)
         
         # Rectangle preview
         if self.drawing and self.drawing_mode == "rectangle" and self.rect_start:
@@ -820,6 +1051,11 @@ class GeoRefApp:
                 rect_ys = [y1, y1, y2, y2, y1]
                 self.ax.plot(rect_xs, rect_ys, '--', color='cyan', alpha=0.7)
         
+        # Restore view limits if they existed
+        if has_limits:
+            self.ax.set_xlim(current_xlim)
+            self.ax.set_ylim(current_ylim)
+            
         self.canvas.draw_idle()
 
     def status(self, msg: str):
@@ -921,6 +1157,15 @@ class GeoRefApp:
         self.ax.set_xlim(new_xlim)
         self.ax.set_ylim(new_ylim)
         self.canvas.draw_idle()
+
+    def _ask_polygon_name(self) -> str:
+        """Ask user for a polygon name and return it"""
+        name = simpledialog.askstring("Nombre del Polígono", 
+                                    "Introduzca un nombre para el polígono:",
+                                    initialvalue=f"Polígono {self.next_poly_id}")
+        if not name:
+            name = f"Polígono {self.next_poly_id}"
+        return name
 
     def toggle_pan(self):
         """Toggle pan mode on/off"""
