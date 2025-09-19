@@ -115,9 +115,43 @@ class GeoRefApp:
         self.main_pane = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         self.main_pane.pack(fill=tk.BOTH, expand=True)
 
-        # Left frame - controls
-        self.left_frame = ttk.Frame(self.main_pane, padding=5)
-        self.main_pane.add(self.left_frame, weight=0)
+        # Left frame - controls with scrollbar
+        self.left_container = ttk.Frame(self.main_pane, padding=5)
+        self.main_pane.add(self.left_container, weight=0)
+        
+        # Create canvas and scrollbar for left panel
+        self.left_canvas = tk.Canvas(self.left_container, width=250, highlightthickness=0)
+        self.left_scrollbar = ttk.Scrollbar(self.left_container, orient="vertical", command=self.left_canvas.yview)
+        self.left_scrollable_frame = ttk.Frame(self.left_canvas)
+        
+        # Configure scrolling
+        self.left_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
+        )
+        
+        self.left_canvas.create_window((0, 0), window=self.left_scrollable_frame, anchor="nw")
+        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
+        
+        # Pack canvas and scrollbar
+        self.left_canvas.pack(side="left", fill="both", expand=True)
+        self.left_scrollbar.pack(side="right", fill="y")
+        
+        # Bind mousewheel to canvas and frame
+        self.left_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.left_scrollable_frame.bind("<MouseWheel>", self._on_mousewheel)
+        # For Linux
+        self.left_canvas.bind("<Button-4>", self._on_mousewheel)
+        self.left_canvas.bind("<Button-5>", self._on_mousewheel)
+        self.left_scrollable_frame.bind("<Button-4>", self._on_mousewheel)
+        self.left_scrollable_frame.bind("<Button-5>", self._on_mousewheel)
+        
+        # Bind mouse enter events to enable scrolling when mouse is over the left panel
+        self.left_canvas.bind("<Enter>", lambda e: self.left_canvas.focus_set())
+        self.left_scrollable_frame.bind("<Enter>", lambda e: self.left_canvas.focus_set())
+        
+        # Use the scrollable frame as the left_frame for all controls
+        self.left_frame = self.left_scrollable_frame
 
         # Right frame - figure and zoom controls
         self.right_frame = ttk.Frame(self.main_pane)
@@ -181,28 +215,6 @@ class GeoRefApp:
         self.btn_to_polys = ttk.Button(self.left_frame, text="Ir a Polígonos", command=self.go_to_polygons, state=tk.DISABLED)
         self.btn_to_polys.pack(fill='x', pady=(6, 4))
 
-        # Zoom controls
-        zoom_frame = ttk.LabelFrame(self.left_frame, text="Navegación", padding=5)
-        zoom_frame.pack(fill='x', pady=4)
-        
-        # First row of zoom controls
-        zoom_row1 = ttk.Frame(zoom_frame)
-        zoom_row1.pack(fill='x', pady=2)
-        ttk.Button(zoom_row1, text="Zoom In (+)", command=self.zoom_in).pack(side=tk.LEFT, expand=True, fill='x', padx=(0,2))
-        ttk.Button(zoom_row1, text="Zoom Out (-)", command=self.zoom_out).pack(side=tk.LEFT, expand=True, fill='x', padx=(2,0))
-        
-        # Second row of zoom controls
-        zoom_row2 = ttk.Frame(zoom_frame)
-        zoom_row2.pack(fill='x', pady=2)
-        self.pan_button = ttk.Button(zoom_row2, text="Pan (P)", command=self.toggle_pan)
-        self.pan_button.pack(side=tk.LEFT, expand=True, fill='x', padx=(0,2))
-        ttk.Button(zoom_row2, text="Reset (R)", command=self.reset_view).pack(side=tk.LEFT, expand=True, fill='x', padx=(2,0))
-        
-        # Navigation instructions
-        nav_info = ttk.Label(zoom_frame, text="• Rueda del ratón: Zoom\n• Arrastrar: Pan (modo Pan activo)\n• Teclas: +/- zoom, P pan, R reset\n• Flechas ↑↓←→: navegar imagen\n• Del/Backspace: borrar último punto\n• Enter: finalizar polígono, Esc: cancelar", 
-                            font=('TkDefaultFont', 8), foreground='gray')
-        nav_info.pack(fill='x', pady=(4,0))
-
         # Separator for stage 2
         self.sep2 = ttk.Separator(self.left_frame, orient=tk.HORIZONTAL)
         self.sep2.pack(fill='x', pady=4)
@@ -226,6 +238,12 @@ class GeoRefApp:
         ttk.Button(self.left_frame, text="Guardar Shapefile & CSV", command=self.export_polygons, state=tk.NORMAL).pack(fill='x', pady=(8, 4))
         self.status_var = tk.StringVar(value="Listo")
         ttk.Label(self.left_frame, textvariable=self.status_var, wraplength=220, foreground='blue').pack(fill='x', pady=(10,0))
+        
+        # Bind mousewheel to all children widgets in left panel
+        self._bind_mousewheel_to_children(self.left_scrollable_frame)
+        
+        # Set minimum window size to ensure usability
+        self.root.minsize(900, 600)
 
     def _create_image_zoom_controls(self):
         """Create zoom control buttons beside the image"""
@@ -325,6 +343,26 @@ class GeoRefApp:
             justify='center'
         )
         instructions.pack(pady=5)
+
+    def _on_mousewheel(self, event):
+        """Handle mouse wheel scrolling in the left panel"""
+        # Handle different platforms
+        if event.delta:  # Windows
+            self.left_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        else:  # macOS/Linux
+            if event.num == 4:
+                self.left_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.left_canvas.yview_scroll(1, "units")
+    
+    def _bind_mousewheel_to_children(self, widget):
+        """Recursively bind mousewheel event to all children widgets"""
+        widget.bind("<MouseWheel>", self._on_mousewheel)
+        # For Linux
+        widget.bind("<Button-4>", self._on_mousewheel)
+        widget.bind("<Button-5>", self._on_mousewheel)
+        for child in widget.winfo_children():
+            self._bind_mousewheel_to_children(child)
 
     # -------------- IMAGE HANDLING --------------
     def load_image(self):
@@ -1171,17 +1209,11 @@ class GeoRefApp:
         """Toggle pan mode on/off"""
         self.pan_mode = not self.pan_mode
         if self.pan_mode:
-            # Update left panel pan button
-            self.pan_button.config(text="Pan (Activo)")
-            self.pan_button.state(['pressed'])
             # Update image side pan button
             self.image_pan_btn.config(text="✋\nPan ON")
             self.image_pan_btn.state(['pressed'])
             self.status("Modo Pan activado. Arrastre para navegar por la imagen.")
         else:
-            # Update left panel pan button
-            self.pan_button.config(text="Pan (P)")
-            self.pan_button.state(['!pressed'])
             # Update image side pan button
             self.image_pan_btn.config(text="✋\nPan")
             self.image_pan_btn.state(['!pressed'])
