@@ -14,7 +14,7 @@ Aplicación de escritorio para georreferenciar imágenes PNG y digitalizar polí
 
 ## 📄 Licencia
 
-**Código Abierto** - Libre para uso educativo, académico y comercial.
+**Código Abierto** - Libre para uso educativo y académico, no comercial.
 
 ## 🚀 Características
 
